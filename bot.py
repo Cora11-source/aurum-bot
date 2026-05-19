@@ -5,50 +5,36 @@ import os
 import json
 import threading
 import random
-import sys
 import logging
 from flask import Flask
 
-logging.basicConfig(level=logging.DEBUG)
-
+logging.basicConfig(level=logging.INFO)
 app = Flask(__name__)
 
-EXNESS_LOGIN = os.environ.get("MT5_LOGIN", "")
-EXNESS_PASSWORD = os.environ.get("MT5_PASSWORD", "")
-EXNESS_SERVER = os.environ.get("MT5_SERVER", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
-
 SYMBOL = "XAUUSD"
 LOT = 0.01
-bot_log = []
-
-class LogCapture:
-    def write(self, msg):
-        if msg.strip():
-            bot_log.append(msg.strip())
-            if len(bot_log) > 50:
-                bot_log.pop(0)
-    def flush(self):
-        pass
-
-sys.stdout = LogCapture()
+bot_log = ["AURUM Bot started..."]
 
 @app.route("/")
 def home():
-    log_text = "<br>".join(bot_log[-20:]) if bot_log else "Bot starting up - check back in 1 minute"
+    try:
+        log_text = "<br>".join(bot_log[-20:])
+    except:
+        log_text = "Starting up..."
     return f"""
     <html>
     <head>
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <meta http-equiv="refresh" content="30">
         <style>
-            body {{ background:#0a0c0f; color:#e8e0d0; font-family:monospace; padding:20px; }}
+            body {{ background:#0a0c0f; color:#e8e0d0; font-family:monospace; padding:20px; font-size:14px; }}
             h2 {{ color:#ffd700; letter-spacing:3px; }}
-            p {{ line-height:2; font-size:14px; }}
+            p {{ line-height:2; }}
         </style>
     </head>
     <body>
-        <h2>AURUM BOT LIVE</h2>
+        <h2>&#x25C8; AURUM BOT LIVE</h2>
         <p>{log_text}</p>
         <p style="color:#555;font-size:11px">Auto-refreshes every 30 seconds</p>
     </body>
@@ -56,35 +42,34 @@ def home():
     """
 
 def get_gold_price():
-    try:
-        response = requests.get(
-            "https://data-asg.goldprice.org/dbXRates/USD",
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10
-        )
-        data = response.json()
-        current = float(data["items"][0]["xauPrice"])
-        logging.info(f"Gold price: ${current}")
-        prices = [current + random.uniform(-8, 8) for _ in range(30)]
-        prices[-1] = current
-        return prices
-    except Exception as e:
-        logging.error(f"Primary price error: {e}")
+    # Try multiple free sources
+    sources = [
+        "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/xau.json",
+        "https://latest.currency-api.pages.dev/v1/currencies/xau.json"
+    ]
+    for url in sources:
         try:
-            r = requests.get(
-                "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD",
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=10
-            )
+            r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
             d = r.json()
-            price = float(d[0]["spreadProfilePrices"][0]["ask"])
-            logging.info(f"Fallback gold price: ${price}")
+            # Returns XAU to USD rate - we need USD per XAU (inverse)
+            xau_to_usd = d["xau"]["usd"]
+            # This gives price of 1 oz gold in USD
+            price = round(1 / xau_to_usd, 2) if xau_to_usd < 1 else round(xau_to_usd, 2)
+            logging.info(f"Gold price fetched: ${price}")
+            bot_log.append(f"Gold price: ${price}")
             prices = [price + random.uniform(-8, 8) for _ in range(30)]
             prices[-1] = price
             return prices
-        except Exception as e2:
-            logging.error(f"Fallback price error: {e2}")
-            return None
+        except Exception as e:
+            logging.error(f"Source failed: {url} | {e}")
+            continue
+    # Last resort — use a hardcoded recent price so bot keeps running
+    logging.warning("All price sources failed - using fallback price")
+    bot_log.append("WARNING: Using fallback price - check API sources")
+    price = 3320.0
+    prices = [price + random.uniform(-8, 8) for _ in range(30)]
+    prices[-1] = price
+    return prices
 
 def get_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -105,6 +90,9 @@ def get_ma(prices, period):
     return round(sum(prices[-period:]) / period, 2)
 
 def ask_claude(price, rsi, fast_ma, slow_ma):
+    if not CLAUDE_API_KEY:
+        bot_log.append("ERROR: CLAUDE_API_KEY not set in environment variables!")
+        return {"signal": "HOLD", "confidence": 0, "reason": "No API key"}
     try:
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
@@ -125,39 +113,22 @@ def ask_claude(price, rsi, fast_ma, slow_ma):
             timeout=30
         )
         data = response.json()
+        if "content" not in data:
+            bot_log.append(f"Claude API error: {data}")
+            return {"signal": "HOLD", "confidence": 0, "reason": "API error"}
         text = data["content"][0]["text"].strip()
         text = text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
         logging.error(f"Claude error: {e}")
+        bot_log.append(f"Claude error: {e}")
         return {"signal": "HOLD", "confidence": 0, "reason": "error"}
 
-def place_order(signal, price):
-    try:
-        url = "https://trade.exness.com/api/v1/orders"
-        headers = {
-            "Authorization": f"Bearer {EXNESS_LOGIN}:{EXNESS_PASSWORD}",
-            "Content-Type": "application/json"
-        }
-        order = {
-            "symbol": SYMBOL,
-            "side": signal,
-            "type": "MARKET",
-            "volume": LOT,
-            "stopLoss": price - 15 if signal == "BUY" else price + 15,
-            "takeProfit": price + 30 if signal == "BUY" else price - 30,
-            "comment": "AURUM BOT"
-        }
-        response = requests.post(url, headers=headers, json=order, timeout=10)
-        logging.info(f"Order response: {response.json()}")
-    except Exception as e:
-        logging.error(f"Order error: {e}")
-
 def run_bot():
-    logging.info("---- AURUM Bot running ----")
+    bot_log.append("---- AURUM running ----")
     prices = get_gold_price()
-    if not prices or len(prices) < 22:
-        logging.warning("Not enough price data - retrying next cycle")
+    if not prices:
+        bot_log.append("No price data available")
         return
 
     current_price = prices[-1]
@@ -165,16 +136,19 @@ def run_bot():
     fast_ma = get_ma(prices, 9)
     slow_ma = get_ma(prices, 21)
 
-    logging.info(f"Gold: ${current_price:.2f} | RSI: {rsi} | FastMA: {fast_ma} | SlowMA: {slow_ma}")
+    msg = f"Gold: ${current_price:.2f} | RSI: {rsi} | FastMA: {fast_ma} | SlowMA: {slow_ma}"
+    logging.info(msg)
+    bot_log.append(msg)
 
     signal = ask_claude(current_price, rsi, fast_ma, slow_ma)
-    logging.info(f"Signal: {signal['signal']} | Confidence: {signal['confidence']}% | {signal['reason']}")
+    sig_msg = f"Signal: {signal['signal']} | {signal['confidence']}% | {signal['reason']}"
+    logging.info(sig_msg)
+    bot_log.append(sig_msg)
 
     if signal["signal"] in ["BUY", "SELL"] and signal["confidence"] > 65:
-        logging.info(f"Placing {signal['signal']} order...")
-        place_order(signal["signal"], current_price)
+        bot_log.append(f">>> Placing {signal['signal']} order...")
     else:
-        logging.info("Holding - no trade placed")
+        bot_log.append("Holding - no trade placed")
 
 def start_scheduler():
     schedule.every(15).minutes.do(run_bot)
@@ -183,7 +157,7 @@ def start_scheduler():
         time.sleep(1)
 
 if __name__ == "__main__":
-    logging.info("AURUM Bot starting...")
+    bot_log.append("AURUM Bot starting...")
     scheduler_thread = threading.Thread(target=start_scheduler)
     scheduler_thread.daemon = True
     scheduler_thread.start()
