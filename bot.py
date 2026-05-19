@@ -1,26 +1,38 @@
-import MetaTrader5 as mt5
+import requests
 import schedule
 import time
-import requests
 import os
-from flask import Flask
+import json
 import threading
+from flask import Flask
 
-# ── Your Exness credentials (set these in Railway environment variables) ──
-LOGIN = int(os.environ.get("MT5_LOGIN", "0"))
-PASSWORD = os.environ.get("MT5_PASSWORD", "")
-SERVER = os.environ.get("MT5_SERVER", "")
+app = Flask(__name__)
+
+# Credentials from environment variables
+EXNESS_LOGIN = os.environ.get("MT5_LOGIN", "")
+EXNESS_PASSWORD = os.environ.get("MT5_PASSWORD", "")
+EXNESS_SERVER = os.environ.get("MT5_SERVER", "")
 CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY", "")
 
 SYMBOL = "XAUUSD"
 LOT = 0.01
-MAGIC = 123456
-
-app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "AURUM Bot is running!"
+    return "AURUM Bot is running! Gold trading active."
+
+def get_gold_price():
+    try:
+        response = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=15m&range=1d"
+        )
+        data = response.json()
+        closes = data["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+        prices = [p for p in closes if p is not None]
+        return prices
+    except Exception as e:
+        print(f"Price fetch error: {e}")
+        return None
 
 def get_rsi(prices, period=14):
     if len(prices) < period + 1:
@@ -52,93 +64,65 @@ def ask_claude(price, rsi, fast_ma, slow_ma):
             json={
                 "model": "claude-sonnet-4-20250514",
                 "max_tokens": 500,
-                "system": "You are a gold trading AI. Respond ONLY in JSON: {\"signal\": \"BUY\" or \"SELL\" or \"HOLD\", \"confidence\": number, \"reason\": \"string\"}",
+                "system": "You are a gold trading AI. Respond ONLY in JSON with no extra text: {\"signal\": \"BUY\" or \"SELL\" or \"HOLD\", \"confidence\": number between 0-100, \"reason\": \"brief reason\"}",
                 "messages": [{
                     "role": "user",
-                    "content": f"Gold price: {price}, RSI: {rsi}, Fast MA: {fast_ma}, Slow MA: {slow_ma}. What is your signal?"
+                    "content": f"Gold price: ${price:.2f}, RSI: {rsi}, Fast MA (9): {fast_ma}, Slow MA (21): {slow_ma}. Analyse and give signal."
                 }]
             }
         )
         data = response.json()
-        text = data["content"][0]["text"]
-        import json
+        text = data["content"][0]["text"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
         return json.loads(text)
     except Exception as e:
         print(f"Claude error: {e}")
         return {"signal": "HOLD", "confidence": 0, "reason": "error"}
 
+def place_order(signal, price):
+    try:
+        # Exness Trade API endpoint
+        url = "https://trade.exness.com/api/v1/orders"
+        headers = {
+            "Authorization": f"Bearer {EXNESS_LOGIN}:{EXNESS_PASSWORD}",
+            "Content-Type": "application/json"
+        }
+        order = {
+            "symbol": SYMBOL,
+            "side": signal,
+            "type": "MARKET",
+            "volume": LOT,
+            "stopLoss": price - 15 if signal == "BUY" else price + 15,
+            "takeProfit": price + 30 if signal == "BUY" else price - 30,
+            "comment": "AURUM BOT"
+        }
+        response = requests.post(url, headers=headers, json=order)
+        print(f"Order response: {response.json()}")
+    except Exception as e:
+        print(f"Order error: {e}")
+
 def run_bot():
-    print("Connecting to MT5...")
-    if not mt5.initialize(login=LOGIN, password=PASSWORD, server=SERVER):
-        print(f"MT5 init failed: {mt5.last_error()}")
+    print("---- AURUM Bot running ----")
+    prices = get_gold_price()
+    if not prices or len(prices) < 22:
+        print("Not enough price data")
         return
 
-    print("Connected to Exness MT5!")
-    rates = mt5.copy_rates_from_pos(SYMBOL, mt5.TIMEFRAME_M15, 0, 50)
-    if rates is None:
-        print("Could not get price data")
-        mt5.shutdown()
-        return
-
-    prices = [r['close'] for r in rates]
     current_price = prices[-1]
     rsi = get_rsi(prices)
     fast_ma = get_ma(prices, 9)
     slow_ma = get_ma(prices, 21)
 
-    print(f"Price: {current_price} | RSI: {rsi} | Fast MA: {fast_ma} | Slow MA: {slow_ma}")
+    print(f"Gold: ${current_price:.2f} | RSI: {rsi} | FastMA: {fast_ma} | SlowMA: {slow_ma}")
 
     signal = ask_claude(current_price, rsi, fast_ma, slow_ma)
-    print(f"AI Signal: {signal}")
+    print(f"AI Signal: {signal['signal']} | Confidence: {signal['confidence']}% | {signal['reason']}")
 
-    positions = mt5.positions_get(symbol=SYMBOL)
-
-    if signal["signal"] == "BUY" and signal["confidence"] > 65 and len(positions) == 0:
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": SYMBOL,
-            "volume": LOT,
-            "type": mt5.ORDER_TYPE_BUY,
-            "price": mt5.symbol_info_tick(SYMBOL).ask,
-            "sl": current_price - 15,
-            "tp": current_price + 30,
-            "magic": MAGIC,
-            "comment": "AURUM BUY",
-        }
-        result = mt5.order_send(request)
-        print(f"BUY sent: {result}")
-
-    elif signal["signal"] == "SELL" and signal["confidence"] > 65 and len(positions) == 0:
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": SYMBOL,
-            "volume": LOT,
-            "type": mt5.ORDER_TYPE_SELL,
-            "price": mt5.symbol_info_tick(SYMBOL).bid,
-            "sl": current_price + 15,
-            "tp": current_price - 30,
-            "magic": MAGIC,
-            "comment": "AURUM SELL",
-        }
-        result = mt5.order_send(request)
-        print(f"SELL sent: {result}")
-
-    elif signal["signal"] == "HOLD" and len(positions) > 0:
-        for pos in positions:
-            close_request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": SYMBOL,
-                "volume": pos.volume,
-                "type": mt5.ORDER_TYPE_BUY if pos.type == 1 else mt5.ORDER_TYPE_SELL,
-                "position": pos.ticket,
-                "price": mt5.symbol_info_tick(SYMBOL).ask,
-                "magic": MAGIC,
-                "comment": "AURUM CLOSE",
-            }
-            mt5.order_send(close_request)
-            print("Position closed")
-
-    mt5.shutdown()
+    if signal["signal"] in ["BUY", "SELL"] and signal["confidence"] > 65:
+        print(f"Placing {signal['signal']} order...")
+        place_order(signal["signal"], current_price)
+    else:
+        print("Holding - no trade placed")
 
 def start_scheduler():
     schedule.every(15).minutes.do(run_bot)
@@ -147,6 +131,7 @@ def start_scheduler():
         time.sleep(1)
 
 if __name__ == "__main__":
+    print("AURUM Bot starting...")
     scheduler_thread = threading.Thread(target=start_scheduler)
     scheduler_thread.daemon = True
     scheduler_thread.start()
